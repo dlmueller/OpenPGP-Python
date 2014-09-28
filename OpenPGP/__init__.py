@@ -624,10 +624,10 @@ class Packet(object):
         return self.read_unpacked(4, '!L')
 
     def read_mpi(self):
-       """ http://tools.ietf.org/html/rfc4880#section-3.2 """
-       length = self.read_unpacked(2, '!H') # length in bits
-       length = (int)((length + 7) / 8) # length in bytes
-       return self.read_bytes(length)
+        """ http://tools.ietf.org/html/rfc4880#section-3.2 """
+        length = self.read_unpacked(2, '!H') # length in bits
+        length = (int)((length + 7) / 8) # length in bytes
+        return self.read_bytes(length)
 
     def read_unpacked(self, count, fmt):
         """ http://docs.python.org/library/struct.html """
@@ -635,8 +635,8 @@ class Packet(object):
         return unpacked[0] # unpack returns tuple
 
     def read_byte(self):
-      byte = self.read_bytes(1)
-      return byte and byte[0:1] or None
+        byte = self.read_bytes(1)
+        return byte and byte[0:1] or None
 
     def read_bytes(self, count):
         chunk = _ensure_bytes(count, b'', self.input)
@@ -657,6 +657,75 @@ class Packet(object):
 
     def __ne__(self, other):
         return not self.__eq__(other)
+
+
+class _PacketWithSubpackets(object):
+    """Internal base class for packets with subpackets."""
+    
+    subpacket_types = {} #: Only some packets may contain subpackets
+
+    class _Subpacket(object):
+        """
+        Common base class for subpackets of:
+            - SignaturePacket
+            - UserAttributePacket
+            
+        @note: The name 'Subpacket' was already used for the baseclass of the
+            subpackets of SignaturePacket.
+        """
+        def __init__(self, subpacket_types):
+             for tag in subpacket_types:
+                 if subpacket_types[tag] == self.__class__:
+                     self.tag = tag
+                     break    
+                     
+    @classmethod
+    def get_subpackets(cls, input_data):
+        subpackets = []
+        length = len(input_data)
+        while length > 0:
+            subpacket, bytes_used = cls.get_subpacket(input_data)
+            if bytes_used > 0:
+                subpackets.append(subpacket)
+                input_data = input_data[bytes_used:]
+                length -= bytes_used
+            else: # Parsing stuck?
+                break
+        return subpackets
+
+    @classmethod
+    def get_subpacket(cls, input_data):
+        first_octet = ord(input_data[0])
+        if first_octet < 192 : # One octet length, no furthur processing
+            length_of_length = 1
+            length = first_octet
+        elif first_octet <= 223: # Two octet length
+            length_of_length = 2
+            second_octet = ord(input_data[1])
+            length = ((first_octet - 192) << 8) + second_octet + 192
+        elif first_octet == 255: # Five octet length
+            length_of_length = 5
+            length = unpack('!L', input_data[1:5])[0]
+        else :
+            raise NotImplementedError("Should NEVER be reached!")
+        input_data = input_data[length_of_length:] # Chop off length header
+        tag = ord(input_data[0])
+
+        try:
+            subpacket_class = cls.subpacket_types[tag]
+        except KeyError:
+            raise ValueError("%s has no subpacket with tag %r!" % (cls.__name__, tag))
+
+        packet = subpacket_class()
+        packet.tag = tag
+        packet.input = PushbackGenerator(_gen_one(input_data[1:length]))
+        packet.length = length-1
+        packet.read()
+        packet.input = None
+        packet.length = None
+
+        input_data = input_data[length:] # Chop off the data from this packet
+        return (packet, length_of_length + length)
 
 class AsymmetricSessionKeyPacket(Packet):
     """ OpenPGP Public-Key Encrypted Session Key packet (tag 1).
@@ -691,7 +760,7 @@ class AsymmetricSessionKeyPacket(Packet):
         b += self.encrypted_data
         return b
 
-class SignaturePacket(Packet):
+class SignaturePacket(Packet, _PacketWithSubpackets):
     """ OpenPGP Signature packet (tag 2).
         http://tools.ietf.org/html/rfc4880#section-5.2
     """
@@ -865,57 +934,10 @@ class SignaturePacket(Packet):
                 return p.data
         return None
 
-    @classmethod
-    def get_subpackets(cls, input_data):
-        subpackets = []
-        length = len(input_data)
-        while length > 0:
-            subpacket, bytes_used = cls.get_subpacket(input_data)
-            if bytes_used > 0:
-                subpackets.append(subpacket)
-                input_data = input_data[bytes_used:]
-                length -= bytes_used
-            else: # Parsing stuck?
-                break
-        return subpackets
-
-    @classmethod
-    def get_subpacket(cls, input_data):
-        length = ord(input_data[0:1])
-        length_of_length = 1
-        # if($len < 192) One octet length, no furthur processing
-        if length > 190 and length < 255: # Two octet length
-            length_of_length = 2
-            length = ((length - 192) << 8) + ord(input_data[1:2]) + 192
-        if length == 255: # Five octet length
-            length_of_length = 5
-            length = unpack('!L', input_data[1:5])[0]
-        input_data = input_data[length_of_length:] # Chop off length header
-        tag = ord(input_data[0:1])
-
-        try:
-            klass = cls.subpacket_types[tag]
-        except KeyError:
-            klass = SignaturePacket.Subpacket
-
-        packet = klass()
-        packet.tag = tag
-        packet.input = PushbackGenerator(_gen_one(input_data[1:length]))
-        packet.length = length-1
-        packet.read()
-        packet.input = None
-        packet.length = None
-
-        input_data = input_data[length:] # Chop off the data from this packet
-        return (packet, length_of_length + length)
-
-    class Subpacket(Packet):
+    class Subpacket(Packet, _PacketWithSubpackets._Subpacket):
         def __init__(self, data=None):
-             super(SignaturePacket.Subpacket, self).__init__()
-             for tag in SignaturePacket.subpacket_types:
-                 if SignaturePacket.subpacket_types[tag] == self.__class__:
-                     self.tag = tag
-                     break
+             Packet.__init__(self)
+             _PacketWithSubpackets._Subpacket.__init__(self, SignaturePacket.subpacket_types)
 
         def header_and_body(self):
             body = self.body() or '' # Get body first, we'll need its length
@@ -1581,12 +1603,57 @@ class UserIDPacket(Packet):
     def body(self):
         return self.__str__().encode('utf-8')
 
-class UserAttributePacket(Packet):
+class UserAttributePacket(Packet, _PacketWithSubpackets):
     """ OpenPGP User Attribute packet (tag 17).
         http://tools.ietf.org/html/rfc4880#section-5.12
-        http://tools.ietf.org/html/rfc4880#section-11.1
+        http://tools.ietf.org/html/rfc4880#section-10.2.1
     """
-    pass # TODO
+
+    def __init__(self) :
+        self.data = None
+        self.subpackets = [] # TODO: seperate hashed/unhased subpackets
+
+    def read(self):
+        self.data = self.read_bytes(self.length)
+        self.subpackets = type(self).get_subpackets(self.data)
+
+    class ImageAttributeSubpacket(Packet, _PacketWithSubpackets._Subpacket):
+        """ http://tools.ietf.org/html/rfc4880#section-5.12.1 
+        """
+        def __init__(self, data=None):
+            """
+            """
+            Packet.__init__(self)
+            _PacketWithSubpackets._Subpacket.__init__(self, UserAttributePacket.subpacket_types)
+            self.data = data
+
+        def read(self):
+            # header length is little-endian!
+            lsb = ord(self.read_byte())
+            msb = ord(self.read_byte())
+            self.header_length = (msb << 8) + lsb 
+            self.version = ord(self.read_byte())
+            if self.version == 1 :
+                self.encoding_format = ord(self.read_byte()) # 1 = JPEG encoding
+                self.reserved_octests = self.read_bytes(12)
+                self.data = self.read_bytes(self.length)
+            else :
+                raise NotImplementedError("Unknown version of ImageAttributeSubpacket: %r" % (self.version,))
+
+        def writeToFile(self, filename):
+            with open(filename, "wb") as f:
+                f.write(self.data)
+
+    subpacket_types = {
+        1: ImageAttributeSubpacket,
+        # Subpacket types 100 through 110 are reserved for private or experimental use.
+    }
+
+    image_format_types = {
+        1 : "JPEG",
+        # Image format types 100 through 110 are reserved for private or experimental use
+    }
+
 
 class IntegrityProtectedDataPacket(EncryptedDataPacket):
     """ OpenPGP Sym. Encrypted Integrity Protected Data packet (tag 18).
